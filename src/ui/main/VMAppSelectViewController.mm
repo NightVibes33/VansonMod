@@ -19,6 +19,8 @@
 extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #define PROC_PIDPATHINFO_MAXSIZE 4096
 
+@class VMSystemMemoryMonitorViewController;
+
 // 0=Running, 1=All, 2=System
 typedef NS_ENUM(NSInteger, VMAppFilterMode) {
   VMAppFilterRunning = 0,
