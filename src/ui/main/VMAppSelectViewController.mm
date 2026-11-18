@@ -10,10 +10,16 @@
 #import "include/VMPointerManager.h"
 #import "include/VMLockManager.h"
 #include <signal.h>
+#include <libproc.h>
+#include <mach/mach_host.h>
+#include <mach/vm_statistics.h>
+#include <sys/proc.h>
 #include <sys/sysctl.h>
 #define TR(key) ([[VMLocalization shared] localizedString:key])
 extern "C" int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 #define PROC_PIDPATHINFO_MAXSIZE 4096
+
+@class VMSystemMemoryMonitorViewController;
 
 // 0=Running, 1=All, 2=System
 typedef NS_ENUM(NSInteger, VMAppFilterMode) {
@@ -51,12 +57,19 @@ typedef NS_ENUM(NSInteger, VMAppFilterMode) {
   self.systemApps = [NSMutableArray array];
   self.allInstalledApps = [NSMutableArray array];
 
-  // Right nav: backup manager
-  self.navigationItem.rightBarButtonItem =
+  // Right nav: live system memory monitor + backup manager
+  UIBarButtonItem *memoryItem =
+      [[UIBarButtonItem alloc] initWithTitle:@"RAM"
+                                       style:UIBarButtonItemStylePlain
+                                      target:self
+                                      action:@selector(openSystemMemoryMonitor)];
+  memoryItem.image = [UIImage systemImageNamed:@"memorychip"];
+  UIBarButtonItem *backupItem =
       [[UIBarButtonItem alloc] initWithTitle:TR(@"Backups_Global_Title")
                                        style:UIBarButtonItemStylePlain
                                       target:self
                                       action:@selector(openGlobalBackup)];
+  self.navigationItem.rightBarButtonItems = @[ memoryItem, backupItem ];
 
   self.navigationItem.leftBarButtonItem = nil;
 
@@ -105,6 +118,11 @@ typedef NS_ENUM(NSInteger, VMAppFilterMode) {
 
 - (void)openGlobalBackup {
   VMBackupListViewController *vc = [[VMBackupListViewController alloc] init];
+  [self.navigationController pushViewController:vc animated:YES];
+}
+
+- (void)openSystemMemoryMonitor {
+  UIViewController *vc = [[VMSystemMemoryMonitorViewController alloc] init];
   [self.navigationController pushViewController:vc animated:YES];
 }
 
@@ -934,6 +952,247 @@ typedef NS_ENUM(NSInteger, VMAppFilterMode) {
       style:UIAlertActionStyleCancel handler:nil]];
 
   [self presentViewController:alert animated:YES completion:nil];
+}
+
+@end
+
+
+#pragma mark - Device-wide Read-only Memory Monitor
+
+@interface VMSystemMemoryMonitorViewController : UITableViewController
+@property(nonatomic, assign) uint64_t totalMemory;
+@property(nonatomic, assign) uint64_t freeMemory;
+@property(nonatomic, assign) uint64_t activeMemory;
+@property(nonatomic, assign) uint64_t inactiveMemory;
+@property(nonatomic, assign) uint64_t wiredMemory;
+@property(nonatomic, assign) uint64_t compressedMemory;
+@property(nonatomic, strong) NSArray<NSDictionary *> *processes;
+@property(nonatomic, assign) BOOL hasVMStatistics;
+@property(nonatomic, assign) BOOL isRefreshing;
+@end
+
+@implementation VMSystemMemoryMonitorViewController
+
+- (instancetype)init {
+  return [super initWithStyle:UITableViewStyleInsetGrouped];
+}
+
+- (void)viewDidLoad {
+  [super viewDidLoad];
+  self.title = @"System Memory";
+  self.view.backgroundColor = [UIColor systemGroupedBackgroundColor];
+  self.processes = @[];
+  self.navigationItem.rightBarButtonItem =
+      [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
+                                                    target:self
+                                                    action:@selector(refreshSnapshot)];
+  UIRefreshControl *refresh = [[UIRefreshControl alloc] init];
+  [refresh addTarget:self action:@selector(refreshSnapshot)
+    forControlEvents:UIControlEventValueChanged];
+  self.refreshControl = refresh;
+  [self refreshSnapshot];
+}
+
+- (NSString *)formattedBytes:(uint64_t)value {
+  return [NSByteCountFormatter stringFromByteCount:(long long)value
+                                        countStyle:NSByteCountFormatterCountStyleMemory];
+}
+
+- (void)refreshSnapshot {
+  if (self.isRefreshing) return;
+  self.isRefreshing = YES;
+  [self.refreshControl beginRefreshing];
+
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+    uint64_t total = 0;
+    size_t totalSize = sizeof(total);
+    sysctlbyname("hw.memsize", &total, &totalSize, NULL, 0);
+
+    uint64_t freeBytes = 0, activeBytes = 0, inactiveBytes = 0;
+    uint64_t wiredBytes = 0, compressedBytes = 0;
+    BOOL statsOK = NO;
+    vm_statistics64_data_t vmStats = {};
+    mach_msg_type_number_t vmCount = HOST_VM_INFO64_COUNT;
+    mach_port_t host = mach_host_self();
+    kern_return_t kr = host_statistics64(host, HOST_VM_INFO64,
+                                         (host_info64_t)&vmStats, &vmCount);
+    mach_port_deallocate(mach_task_self(), host);
+    if (kr == KERN_SUCCESS) {
+      uint64_t pageSize = (uint64_t)vm_page_size;
+      freeBytes = ((uint64_t)vmStats.free_count +
+                   (uint64_t)vmStats.speculative_count) * pageSize;
+      activeBytes = (uint64_t)vmStats.active_count * pageSize;
+      inactiveBytes = (uint64_t)vmStats.inactive_count * pageSize;
+      wiredBytes = (uint64_t)vmStats.wire_count * pageSize;
+      compressedBytes = (uint64_t)vmStats.compressor_page_count * pageSize;
+      statsOK = YES;
+    }
+
+    NSMutableArray<NSDictionary *> *rows = [NSMutableArray array];
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
+    size_t procBytes = 0;
+    if (sysctl(mib, 4, NULL, &procBytes, NULL, 0) == 0 && procBytes > 0) {
+      struct kinfo_proc *entries = (struct kinfo_proc *)calloc(1, procBytes);
+      if (entries) {
+        if (sysctl(mib, 4, entries, &procBytes, NULL, 0) == 0) {
+          size_t count = procBytes / sizeof(struct kinfo_proc);
+          for (size_t i = 0; i < count; i++) {
+            pid_t pid = entries[i].kp_proc.p_pid;
+            if (pid <= 0) continue;
+
+            struct proc_taskinfo taskInfo = {};
+            int infoBytes = proc_pidinfo(pid, PROC_PIDTASKINFO, 0,
+                                         &taskInfo, sizeof(taskInfo));
+            NSString *name = [NSString stringWithUTF8String:entries[i].kp_proc.p_comm];
+            if (name.length == 0) name = [NSString stringWithFormat:@"PID %d", pid];
+
+            NSMutableDictionary *row = [@{
+              @"pid": @(pid),
+              @"name": name,
+              @"resident": @((infoBytes == sizeof(taskInfo)) ? taskInfo.pti_resident_size : 0),
+              @"virtual": @((infoBytes == sizeof(taskInfo)) ? taskInfo.pti_virtual_size : 0),
+              @"available": @(infoBytes == sizeof(taskInfo))
+            } mutableCopy];
+            [rows addObject:row];
+          }
+        }
+        free(entries);
+      }
+    }
+    [rows sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+      unsigned long long av = [a[@"resident"] unsignedLongLongValue];
+      unsigned long long bv = [b[@"resident"] unsignedLongLongValue];
+      if (av > bv) return NSOrderedAscending;
+      if (av < bv) return NSOrderedDescending;
+      return [a[@"name"] localizedCaseInsensitiveCompare:b[@"name"]];
+    }];
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+      self.totalMemory = total;
+      self.freeMemory = freeBytes;
+      self.activeMemory = activeBytes;
+      self.inactiveMemory = inactiveBytes;
+      self.wiredMemory = wiredBytes;
+      self.compressedMemory = compressedBytes;
+      self.hasVMStatistics = statsOK;
+      self.processes = rows;
+      self.isRefreshing = NO;
+      [self.refreshControl endRefreshing];
+      [self.tableView reloadData];
+    });
+  });
+}
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView {
+  return 2;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+  return section == 0 ? 7 : self.processes.count;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
+  return section == 0 ? @"PHYSICAL MEMORY" : [NSString stringWithFormat:@"RUNNING PROCESSES · %lu", (unsigned long)self.processes.count];
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+  if (section == 0) {
+    return @"System counters are read-only. Kernel pages and protected memory contents are not exposed by these APIs.";
+  }
+  return @"Resident size is per-process resident memory, not a guaranteed physical-footprint or exclusive-RAM figure. Some processes may deny metadata queries.";
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView
+         cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+  static NSString *identifier = @"VMSystemMemoryCell";
+  UITableViewCell *cell = [tableView dequeueReusableCellWithIdentifier:identifier];
+  if (!cell) {
+    cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1
+                                  reuseIdentifier:identifier];
+  }
+  cell.selectionStyle = indexPath.section == 1 ? UITableViewCellSelectionStyleDefault : UITableViewCellSelectionStyleNone;
+  cell.accessoryType = UITableViewCellAccessoryNone;
+  cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+
+  if (indexPath.section == 0) {
+    NSArray<NSString *> *labels = @[
+      @"Installed physical RAM",
+      @"Free + speculative",
+      @"Active pages",
+      @"Inactive pages",
+      @"Wired pages",
+      @"Compressed pages",
+      @"Kernel memory access"
+    ];
+    uint64_t values[] = {
+      self.totalMemory, self.freeMemory, self.activeMemory,
+      self.inactiveMemory, self.wiredMemory, self.compressedMemory, 0
+    };
+    cell.textLabel.text = labels[indexPath.row];
+    if (indexPath.row == 6) {
+      cell.detailTextLabel.text = @"Not exposed";
+    } else if (indexPath.row == 0) {
+      cell.detailTextLabel.text = self.totalMemory ? [self formattedBytes:values[indexPath.row]] : @"Unavailable";
+    } else {
+      cell.detailTextLabel.text = self.hasVMStatistics ? [self formattedBytes:values[indexPath.row]] : @"Unavailable";
+    }
+    cell.imageView.image = [UIImage systemImageNamed:(indexPath.row == 6 ? @"lock.fill" : @"memorychip")];
+    cell.imageView.tintColor = indexPath.row == 6 ? [UIColor tertiaryLabelColor] : [UIColor systemBlueColor];
+  } else {
+    NSDictionary *process = self.processes[indexPath.row];
+    cell.textLabel.text = [NSString stringWithFormat:@"%@  ·  PID %@", process[@"name"], process[@"pid"]];
+    BOOL available = [process[@"available"] boolValue];
+    if (available) {
+      cell.detailTextLabel.text = [NSString stringWithFormat:@"%@ resident · %@ virtual",
+        [self formattedBytes:[process[@"resident"] unsignedLongLongValue]],
+        [self formattedBytes:[process[@"virtual"] unsignedLongLongValue]]];
+    } else {
+      cell.detailTextLabel.text = @"Memory details unavailable";
+    }
+    cell.imageView.image = [UIImage systemImageNamed:@"app"];
+    cell.imageView.tintColor = [UIColor secondaryLabelColor];
+    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+  }
+  return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+  [tableView deselectRowAtIndexPath:indexPath animated:YES];
+  if (indexPath.section != 1) return;
+
+  NSDictionary *process = self.processes[indexPath.row];
+  pid_t pid = [process[@"pid"] intValue];
+  NSString *name = process[@"name"] ?: [NSString stringWithFormat:@"PID %d", pid];
+  UIAlertController *menu = [UIAlertController
+      alertControllerWithTitle:name
+                       message:[NSString stringWithFormat:@"PID %d\\nResident: %@",
+                         pid, [self formattedBytes:[process[@"resident"] unsignedLongLongValue]]]
+                preferredStyle:UIAlertControllerStyleActionSheet];
+
+  [menu addAction:[UIAlertAction actionWithTitle:@"Attach in Memory Debug"
+      style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+    BOOL attached = [[VMMemoryEngine shared] attachToPid:pid];
+    if (attached) {
+      self.tabBarController.selectedIndex = 1;
+    } else {
+      UIAlertController *error = [UIAlertController
+          alertControllerWithTitle:@"Attach unavailable"
+                           message:@"task_for_pid was denied for this process in the current signing or privilege environment. The process inventory remains read-only."
+                    preferredStyle:UIAlertControllerStyleAlert];
+      [error addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+      [self presentViewController:error animated:YES completion:nil];
+    }
+  }]];
+  [menu addAction:[UIAlertAction actionWithTitle:@"Copy PID"
+      style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+    [UIPasteboard generalPasteboard].string = [NSString stringWithFormat:@"%d", pid];
+  }]];
+  [menu addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+  if (UIDevice.currentDevice.userInterfaceIdiom == UIUserInterfaceIdiomPad) {
+    menu.popoverPresentationController.sourceView = self.tableView;
+    menu.popoverPresentationController.sourceRect = [self.tableView rectForRowAtIndexPath:indexPath];
+  }
+  [self presentViewController:menu animated:YES completion:nil];
 }
 
 @end
